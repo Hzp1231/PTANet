@@ -1,0 +1,106 @@
+import os
+import cv2
+import numpy as np
+import argparse
+import tensorrt as trt
+
+
+class Calibrator(trt.IInt8EntropyCalibrator2):
+    def __init__(self, rgb_dir, thermal_dir, input_shape, cache_file, batch_size=1):
+        super().__init__()
+        self.batch_size = batch_size
+        self.input_shape = input_shape  # (6, H, W)
+        self.cache_file = cache_file
+
+        self.rgb_list = sorted([os.path.join(rgb_dir, f) for f in os.listdir(rgb_dir) if f.endswith(('.jpg', '.png'))])
+        self.thermal_list = sorted([os.path.join(thermal_dir, f) for f in os.listdir(thermal_dir) if f.endswith(('.jpg', '.png'))])
+        assert len(self.rgb_list) == len(self.thermal_list), "RGB and thermal image counts do not match!"
+
+        self.data = self._load_batches()
+        self.current_index = 0
+
+    def _load_batches(self):
+        H, W = self.input_shape[1], self.input_shape[2]
+        all_batches = []
+
+        for rgb_path, thermal_path in zip(self.rgb_list, self.thermal_list):
+            rgb = cv2.imread(rgb_path)
+            thermal = cv2.imread(thermal_path, cv2.IMREAD_GRAYSCALE)
+
+            rgb = cv2.resize(rgb, (W, H)).astype(np.float32) / 255.0
+            thermal = cv2.resize(thermal, (W, H)).astype(np.float32) / 255.0
+
+            rgb = rgb.transpose(2, 0, 1)  # (3, H, W)
+            thermal_stack = np.stack([thermal] * 3, axis=0)  # (3, H, W)
+
+            combined = np.concatenate([rgb, thermal_stack], axis=0)  # (6, H, W)
+            all_batches.append(combined)
+
+        all_batches = np.stack(all_batches, axis=0)  # (N, 6, H, W)
+        return all_batches
+
+    def get_batch_size(self):
+        return self.batch_size
+
+    def get_batch(self, names):
+        if self.current_index + self.batch_size > len(self.data):
+            return None
+        batch = self.data[self.current_index:self.current_index + self.batch_size]
+        self.current_index += self.batch_size
+        return [batch.ravel().astype(np.float32).tobytes()]
+
+    def read_calibration_cache(self):
+        if os.path.exists(self.cache_file):
+            with open(self.cache_file, 'rb') as f:
+                return f.read()
+        return None
+
+    def write_calibration_cache(self, cache):
+        with open(self.cache_file, 'wb') as f:
+            f.write(cache)
+
+
+def build_engine(onnx_path, engine_path, input_shape, rgb_dir, thermal_dir, batch_size):
+    TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(TRT_LOGGER)
+    network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    network = builder.create_network(network_flags)
+    parser = trt.OnnxParser(network, TRT_LOGGER)
+
+    with open(onnx_path, 'rb') as f:
+        if not parser.parse(f.read()):
+            for error in range(parser.num_errors):
+                print(parser.get_error(error))
+            return
+
+    config = builder.create_builder_config()
+    config.max_workspace_size = 1 << 30  # 1GB
+
+    calibrator = Calibrator(rgb_dir, thermal_dir, input_shape, cache_file="calib_cache.bin", batch_size=batch_size)
+    config.set_flag(trt.BuilderFlag.INT8)
+    config.int8_calibrator = calibrator
+
+    print("Building engine... This may take a few minutes.")
+    engine = builder.build_engine(network, config)
+    if engine is not None:
+        with open(engine_path, 'wb') as f:
+            f.write(engine.serialize())
+        print(f"Engine saved to {engine_path}")
+    else:
+        print("Failed to build engine.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--onnx', type=str, required=True, help="Path to ONNX model")
+    parser.add_argument('--engine', type=str, required=True, help="Output engine file path")
+    parser.add_argument('--rgb', type=str, required=True, help="Folder of RGB images")
+    parser.add_argument('--thermal', type=str, required=True, help="Folder of thermal images")
+    parser.add_argument('--shape', type=str, default="6x224x224", help="Model input shape (C×H×W)")
+    parser.add_argument('--batch_size', type=int, default=1)
+
+    args = parser.parse_args()
+    c, h, w = map(int, args.shape.lower().split('x'))
+    input_shape = (c, h, w)
+
+    build_engine(args.onnx, args.engine, input_shape, args.rgb, args.thermal, args.batch_size)
